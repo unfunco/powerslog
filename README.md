@@ -12,15 +12,18 @@
 package main
 
 import (
-  "log/slog"
+	"log/slog"
+	"os"
 
-  "github.com/unfunco/powerslog"
+	"github.com/unfunco/powerslog"
 )
 
 func main() {
-  logHandler := powerslog.NewHandler(nil)
-  logger := slog.New(logHandler)
-  logger.Info("Hello, world!")
+	jsonHandler := slog.NewJSONHandler(os.Stdout, nil)
+	powerslogHandler := powerslog.NewHandler(jsonHandler, nil)
+	logger := slog.New(powerslogHandler)
+
+	logger.Info("Hello, world!")
 }
 ```
 
