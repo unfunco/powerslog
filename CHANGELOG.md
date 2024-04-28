@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/unfunco/powerslog/compare/v0.1.0...v0.1.1) (2024-04-28)
+
+
+### Miscellaneous
+
+* Add a lambda function to help with testing ([#4](https://github.com/unfunco/powerslog/issues/4)) ([b8c003a](https://github.com/unfunco/powerslog/commit/b8c003aae20a58f040c346e6e2c02ad55ef61438))
+
 ## 0.1.0 (2024-04-28)
 
 
