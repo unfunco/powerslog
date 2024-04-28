@@ -1,0 +1,18 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Deploys a test function for the github.com/unfunco/powerslog project.
+
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  TestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Architectures: [ arm64 ]
+      Description: Test function for the github.com/unfunco/powerslog project.
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: powerslog-test
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Timeout: 5
