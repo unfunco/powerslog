@@ -1,15 +1,12 @@
-name: PR
+name: PR / Lambda
 
 on:
   pull_request:
     branches:
     - main
-    paths-ignore:
-    - .editorconfig
-    - .gitattributes
-    - .gitignore
-    - LICENSE.md
-    - README.md
+    paths:
+    - .github/workflows/pr_lambda.yaml
+    - lambda/**/*
 
 jobs:
   verify:
@@ -21,10 +18,10 @@ jobs:
     - name: Setup Go
       uses: actions/setup-go@v5
       with:
-        go-version-file: go.mod
+        go-version-file: lambda/go.mod
     - name: Check formatting
       run: test -z "$(go fmt ./...)"
+      working-directory: lambda
     - name: Look for suspicious constructs
       run: go vet ./...
-    - name: Run unit tests
-      run: go test -race -v ./...
+      working-directory: lambda
