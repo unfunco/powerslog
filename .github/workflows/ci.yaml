@@ -27,3 +27,23 @@ jobs:
       run: go vet ./...
     - name: Run unit tests
       run: go test -race -v ./...
+
+  release:
+    name: Release?
+    needs: [ verify ]
+    permissions:
+      contents: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Prepare a release
+      id: release
+      uses: google-github-actions/release-please-action@v4
+      with:
+        config-file: .github/release-config.json
+        manifest-file: .github/release-manifest.json
+        token: ${{ secrets.GITHUB_TOKEN }}
