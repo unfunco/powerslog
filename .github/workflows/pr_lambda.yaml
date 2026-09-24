@@ -11,7 +11,7 @@ on:
 jobs:
   verify:
     name: Verify
-    uses: unfunco/meta/.github/workflows/verify-go.yaml@dc15f9a32fe01b1b7cc44e095ab9e9bdd98bb0b7
+    uses: unfunco/meta/.github/workflows/verify-go.yaml@bdb4008b3eb556c67679daa1608cffdd9bc38556
     with:
       working-directory: lambda
-      go-version-file: lambda/go.mod
+      go-version-file: go.mod
