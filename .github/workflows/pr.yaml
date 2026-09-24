@@ -10,21 +10,27 @@ on:
     - .gitignore
     - LICENSE.md
     - README.md
+    - lambda/**
 
 jobs:
   verify:
     name: Verify
+    uses: unfunco/meta/.github/workflows/verify-go.yaml@dc15f9a32fe01b1b7cc44e095ab9e9bdd98bb0b7
+    with:
+      working-directory: .
+      go-version-file: go.mod
+
+  race:
+    name: Race test
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
-    - name: Setup Go
-      uses: actions/setup-go@v5
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version-file: go.mod
-    - name: Check formatting
-      run: test -z "$(go fmt ./...)"
-    - name: Look for suspicious constructs
-      run: go vet ./...
-    - name: Run unit tests
+    - name: Run race tests
       run: go test -race -v ./...
