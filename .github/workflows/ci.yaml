@@ -14,20 +14,10 @@ on:
 jobs:
   verify:
     name: Verify
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    - name: Setup Go
-      uses: actions/setup-go@v5
-      with:
-        go-version-file: go.mod
-    - name: Check formatting
-      run: test -z "$(go fmt ./...)"
-    - name: Look for suspicious constructs
-      run: go vet ./...
-    - name: Run unit tests
-      run: go test -race -v ./...
+    uses: unfunco/meta/.github/workflows/verify-go.yaml@bdb4008b3eb556c67679daa1608cffdd9bc38556
+    with:
+      working-directory: .
+      go-version-file: go.mod
 
   release:
     name: Release?
