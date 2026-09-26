@@ -15,7 +15,4 @@ on:
 jobs:
   verify:
     name: Verify
-    uses: unfunco/meta/.github/workflows/verify-go.yaml@bdb4008b3eb556c67679daa1608cffdd9bc38556
-    with:
-      working-directory: .
-      go-version-file: go.mod
+    uses: unfunco/meta/.github/workflows/verify-go.yaml@2cf07936a31dca1b82fe1e447f48e1580c10880e # v0.2.0
