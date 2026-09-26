@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.1](https://github.com/unfunco/powerslog/compare/v0.1.0...v0.1.1) (2026-09-26)
+
+
+### Miscellaneous
+
+* Add a lambda function to help with testing ([#4](https://github.com/unfunco/powerslog/issues/4)) ([b8c003a](https://github.com/unfunco/powerslog/commit/b8c003aae20a58f040c346e6e2c02ad55ef61438))
+* Adopt Meta v0.2.0 workflows ([#8](https://github.com/unfunco/powerslog/issues/8)) ([4372119](https://github.com/unfunco/powerslog/commit/437211978b8ca312a60a1aaf145884772fc0f1ec))
+* Adopt shared Go verification workflow ([#7](https://github.com/unfunco/powerslog/issues/7)) ([e3082a1](https://github.com/unfunco/powerslog/commit/e3082a133b0333f5af4fea3d70474809f81da457))
+
 ## 0.1.0 (2024-04-28)
 
 
