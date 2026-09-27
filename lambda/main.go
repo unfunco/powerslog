@@ -25,8 +25,7 @@ func handler(ctx context.Context, event events.APIGatewayProxyRequest) (events.A
 }
 
 func main() {
-	jsonHandler := slog.NewJSONHandler(os.Stdout, nil)
-	powerslogHandler := powerslog.NewHandler(jsonHandler)
+	powerslogHandler := powerslog.NewHandler(os.Stdout, &powerslog.HandlerOptions{})
 	logger := slog.New(powerslogHandler)
 
 	ctx := context.WithValue(context.Background(), loggerContextKey, logger)
