@@ -6,10 +6,13 @@ import (
 	"log/slog"
 	"maps"
 	"reflect"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/slogtest"
+	"time"
 
 	"github.com/unfunco/powerslog"
 )
@@ -65,7 +68,15 @@ func TestHandlerConformance(t *testing.T) {
 		if len(records) != 1 {
 			t.Fatalf("got %d records, want 1", len(records))
 		}
-		return records[0]
+		// slogtest looks up the built-in slog keys.
+		record := records[0]
+		for from, to := range map[string]string{"timestamp": slog.TimeKey, "message": slog.MessageKey} {
+			if v, ok := record[from]; ok {
+				record[to] = v
+				delete(record, from)
+			}
+		}
+		return record
 	})
 }
 
@@ -83,7 +94,7 @@ func TestHandler(t *testing.T) {
 			env:  fullLambdaEnv,
 			want: map[string]any{
 				"level":                "INFO",
-				"msg":                  "hello",
+				"message":              "hello",
 				"service":              "test-service",
 				"function_name":        "test-function",
 				"function_memory_size": float64(128),
@@ -93,8 +104,8 @@ func TestHandler(t *testing.T) {
 			name: "no environment variables set",
 			env:  lambdaEnv{},
 			want: map[string]any{
-				"level": "INFO",
-				"msg":   "hello",
+				"level":   "INFO",
+				"message": "hello",
 			},
 		},
 		{
@@ -106,7 +117,7 @@ func TestHandler(t *testing.T) {
 			},
 			want: map[string]any{
 				"level":         "INFO",
-				"msg":           "hello",
+				"message":       "hello",
 				"service":       "test-service",
 				"function_name": "test-function",
 			},
@@ -119,7 +130,7 @@ func TestHandler(t *testing.T) {
 			},
 			want: map[string]any{
 				"level":                "INFO",
-				"msg":                  "hello",
+				"message":              "hello",
 				"service":              "test-service",
 				"function_name":        "test-function",
 				"function_memory_size": float64(128),
@@ -134,7 +145,7 @@ func TestHandler(t *testing.T) {
 			},
 			want: map[string]any{
 				"level":                "INFO",
-				"msg":                  "hello",
+				"message":              "hello",
 				"service":              "test-service",
 				"function_name":        "test-function",
 				"function_memory_size": float64(128),
@@ -247,11 +258,11 @@ func TestHandlerOptions(t *testing.T) {
 				if got := records[0]["level"]; got != "INFO" {
 					t.Errorf("level = %v, want INFO", got)
 				}
-				if _, ok := records[0]["time"]; !ok {
-					t.Error("time attribute missing")
+				if _, ok := records[0]["timestamp"]; !ok {
+					t.Error("timestamp attribute missing")
 				}
-				if _, ok := records[0]["source"]; ok {
-					t.Error("unexpected source attribute")
+				if _, ok := records[0]["location"]; ok {
+					t.Error("unexpected location attribute")
 				}
 			},
 		},
@@ -274,12 +285,12 @@ func TestHandlerOptions(t *testing.T) {
 				if len(records) != 1 {
 					t.Fatalf("got %d records, want 1", len(records))
 				}
-				source, ok := records[0]["source"].(map[string]any)
+				location, ok := records[0]["location"].(string)
 				if !ok {
-					t.Fatalf("source = %v, want an object", records[0]["source"])
+					t.Fatalf("location = %v, want a string", records[0]["location"])
 				}
-				if file, _ := source["file"].(string); !strings.HasSuffix(file, "powerslog_test.go") {
-					t.Errorf("source file = %q, want suffix powerslog_test.go", file)
+				if !strings.HasPrefix(location, "github.com/unfunco/powerslog_test.TestHandlerOptions") {
+					t.Errorf("location = %q, want prefix github.com/unfunco/powerslog_test.TestHandlerOptions", location)
 				}
 			},
 		},
@@ -288,7 +299,7 @@ func TestHandlerOptions(t *testing.T) {
 			opts: &powerslog.Options{
 				ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
 					switch a.Key {
-					case slog.TimeKey:
+					case "timestamp":
 						return slog.Attr{}
 					case "service":
 						return slog.String("service", "replaced")
@@ -300,8 +311,8 @@ func TestHandlerOptions(t *testing.T) {
 				if len(records) != 1 {
 					t.Fatalf("got %d records, want 1", len(records))
 				}
-				if _, ok := records[0]["time"]; ok {
-					t.Error("time attribute not removed")
+				if _, ok := records[0]["timestamp"]; ok {
+					t.Error("timestamp attribute not removed")
 				}
 				if got := records[0]["service"]; got != "replaced" {
 					t.Errorf("service = %v, want replaced", got)
@@ -321,5 +332,184 @@ func TestHandlerOptions(t *testing.T) {
 
 			tt.check(t, decodeLines(t, buf))
 		})
+	}
+}
+
+func TestHandlerTimestamp(t *testing.T) {
+	tests := []struct {
+		name string
+		time time.Time
+		want string
+	}{
+		{
+			name: "UTC time",
+			time: time.Date(2021, 12, 12, 21, 21, 8, 921_000_000, time.UTC),
+			want: "2021-12-12T21:21:08.921Z",
+		},
+		{
+			name: "non-UTC time is converted to UTC",
+			time: time.Date(2021, 12, 12, 22, 21, 8, 921_000_000, time.FixedZone("CET", 3600)),
+			want: "2021-12-12T21:21:08.921Z",
+		},
+		{
+			name: "sub-millisecond precision is truncated",
+			time: time.Date(2021, 12, 12, 21, 21, 8, 921_999_999, time.UTC),
+			want: "2021-12-12T21:21:08.921Z",
+		},
+		{
+			name: "whole seconds keep millisecond precision",
+			time: time.Date(2021, 12, 12, 21, 21, 8, 0, time.UTC),
+			want: "2021-12-12T21:21:08.000Z",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler, buf := newTestHandler(t, nil)
+			if err := handler.Handle(t.Context(), slog.NewRecord(tt.time, slog.LevelInfo, "hello", 0)); err != nil {
+				t.Fatal(err)
+			}
+
+			records := decodeLines(t, buf)
+			if len(records) != 1 {
+				t.Fatalf("got %d records, want 1", len(records))
+			}
+			if got := records[0]["timestamp"]; got != tt.want {
+				t.Errorf("timestamp = %v, want %v", got, tt.want)
+			}
+			if _, ok := records[0]["time"]; ok {
+				t.Error("unexpected time attribute")
+			}
+		})
+	}
+}
+
+func TestHandlerZeroTimeIsOmitted(t *testing.T) {
+	handler, buf := newTestHandler(t, nil)
+	if err := handler.Handle(t.Context(), slog.NewRecord(time.Time{}, slog.LevelInfo, "hello", 0)); err != nil {
+		t.Fatal(err)
+	}
+
+	records := decodeLines(t, buf)
+	if len(records) != 1 {
+		t.Fatalf("got %d records, want 1", len(records))
+	}
+	for _, key := range []string{"timestamp", "time"} {
+		if _, ok := records[0][key]; ok {
+			t.Errorf("unexpected %s attribute", key)
+		}
+	}
+}
+
+func TestHandlerMessageAndLevel(t *testing.T) {
+	handler, buf := newTestHandler(t, nil)
+	slog.New(handler).Warn("hello")
+
+	records := decodeLines(t, buf)
+	if len(records) != 1 {
+		t.Fatalf("got %d records, want 1", len(records))
+	}
+	if got := records[0]["message"]; got != "hello" {
+		t.Errorf("message = %v, want hello", got)
+	}
+	if got := records[0]["level"]; got != "WARN" {
+		t.Errorf("level = %v, want WARN", got)
+	}
+	if _, ok := records[0]["msg"]; ok {
+		t.Error("unexpected msg attribute")
+	}
+}
+
+func logWithLocation(logger *slog.Logger) int {
+	_, _, line, _ := runtime.Caller(0)
+	logger.Info("hello")
+	return line + 1
+}
+
+func TestHandlerLocation(t *testing.T) {
+	handler, buf := newTestHandler(t, &powerslog.Options{AddSource: true})
+	line := logWithLocation(slog.New(handler))
+
+	records := decodeLines(t, buf)
+	if len(records) != 1 {
+		t.Fatalf("got %d records, want 1", len(records))
+	}
+	want := "github.com/unfunco/powerslog_test.logWithLocation:" + strconv.Itoa(line)
+	if got := records[0]["location"]; got != want {
+		t.Errorf("location = %v, want %v", got, want)
+	}
+	if _, ok := records[0]["source"]; ok {
+		t.Error("unexpected source attribute")
+	}
+}
+
+func TestHandlerDoesNotRenameInsideGroups(t *testing.T) {
+	ts := time.Date(2021, 12, 12, 21, 21, 8, 921_000_000, time.UTC)
+	src := &slog.Source{Function: "main.handler", File: "main.go", Line: 12}
+
+	handler, buf := newTestHandler(t, &powerslog.Options{ReplaceAttr: removeTimeAttr()})
+	slog.New(handler.WithGroup("outer")).Info("hello",
+		slog.Group("inner",
+			slog.Time(slog.TimeKey, ts),
+			slog.String(slog.MessageKey, "nested"),
+			slog.Any(slog.SourceKey, src),
+		),
+	)
+
+	records := decodeLines(t, buf)
+	if len(records) != 1 {
+		t.Fatalf("got %d records, want 1", len(records))
+	}
+	got := records[0]
+	if got["message"] != "hello" {
+		t.Errorf("message = %v, want hello", got["message"])
+	}
+	outer, _ := got["outer"].(map[string]any)
+	inner, ok := outer["inner"].(map[string]any)
+	if !ok {
+		t.Fatalf("outer.inner = %v, want an object", outer["inner"])
+	}
+	want := map[string]any{
+		slog.TimeKey:    ts.Format(time.RFC3339Nano),
+		slog.MessageKey: "nested",
+		slog.SourceKey: map[string]any{
+			"function": "main.handler",
+			"file":     "main.go",
+			"line":     float64(12),
+		},
+	}
+	if !reflect.DeepEqual(inner, want) {
+		t.Errorf("outer.inner = %v\nwant %v", inner, want)
+	}
+}
+
+func TestHandlerReplaceAttrSeesPowertoolsNames(t *testing.T) {
+	lambdaEnv{}.set(t)
+
+	var keys []string
+	handler, buf := newTestHandler(t, &powerslog.Options{
+		AddSource: true,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if len(groups) == 0 {
+				keys = append(keys, a.Key)
+			}
+			if a.Key == "message" {
+				return slog.String("message", "replaced")
+			}
+			return a
+		},
+	})
+	slog.New(handler).Info("hello")
+
+	want := []string{"timestamp", "level", "location", "message"}
+	if !reflect.DeepEqual(keys, want) {
+		t.Errorf("ReplaceAttr keys = %v, want %v", keys, want)
+	}
+	records := decodeLines(t, buf)
+	if len(records) != 1 {
+		t.Fatalf("got %d records, want 1", len(records))
+	}
+	if got := records[0]["message"]; got != "replaced" {
+		t.Errorf("message = %v, want replaced", got)
 	}
 }

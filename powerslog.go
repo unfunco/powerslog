@@ -19,8 +19,13 @@ const (
 	envVarPowertoolsServiceName = "POWERTOOLS_SERVICE_NAME"
 
 	attrKeyFunctionName = "function_name"
+	attrKeyLocation     = "location"
 	attrKeyMemorySize   = "function_memory_size"
+	attrKeyMessage      = "message"
 	attrKeyService      = "service"
+	attrKeyTimestamp    = "timestamp"
+
+	timestampFormat = "2006-01-02T15:04:05.000Z"
 )
 
 // Options configures a [Handler]. A nil *Options is equivalent to the zero
@@ -33,7 +38,9 @@ type Options struct {
 	AddSource bool
 
 	// ReplaceAttr is called to rewrite each non-group attribute before it is
-	// logged, see [slog.HandlerOptions].
+	// logged, see [slog.HandlerOptions]. It is called after the built-in
+	// attributes have been renamed, so it sees the timestamp, message and
+	// location keys rather than the time, msg and source keys.
 	ReplaceAttr func(groups []string, a slog.Attr) slog.Attr
 }
 
@@ -53,7 +60,7 @@ func NewHandler(w io.Writer, opts *Options) *Handler {
 	var handler slog.Handler = slog.NewJSONHandler(w, &slog.HandlerOptions{
 		AddSource:   opts.AddSource,
 		Level:       opts.Level,
-		ReplaceAttr: opts.ReplaceAttr,
+		ReplaceAttr: replaceAttr(opts.ReplaceAttr),
 	})
 
 	var attrs []slog.Attr
@@ -98,6 +105,34 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 	return &Handler{
 		parent: h.parent.WithGroup(name),
 	}
+}
+
+func replaceAttr(next func([]string, slog.Attr) slog.Attr) func([]string, slog.Attr) slog.Attr {
+	return func(groups []string, a slog.Attr) slog.Attr {
+		if len(groups) == 0 {
+			a = renameBuiltin(a)
+		}
+		if next != nil {
+			return next(groups, a)
+		}
+		return a
+	}
+}
+
+func renameBuiltin(a slog.Attr) slog.Attr {
+	switch a.Key {
+	case slog.TimeKey:
+		if a.Value.Kind() == slog.KindTime {
+			return slog.String(attrKeyTimestamp, a.Value.Time().UTC().Format(timestampFormat))
+		}
+	case slog.MessageKey:
+		return slog.Attr{Key: attrKeyMessage, Value: a.Value}
+	case slog.SourceKey:
+		if src, ok := a.Value.Any().(*slog.Source); ok && src != nil {
+			return slog.String(attrKeyLocation, src.Function+":"+strconv.Itoa(src.Line))
+		}
+	}
+	return a
 }
 
 func getFunctionMemorySize() slog.Attr {
