@@ -7,6 +7,7 @@ package powerslog
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"strconv"
@@ -22,16 +23,39 @@ const (
 	attrKeyService      = "service"
 )
 
-// Handler is a [slog.Handler] that wraps a parent handler and adds key fields
-// from the AWS Lambda environment to every record.
+// Options configures a [Handler]. A nil *Options is equivalent to the zero
+// value.
+type Options struct {
+	// Level is the minimum level of records to log. Defaults to [slog.LevelInfo].
+	Level slog.Leveler
+
+	// AddSource adds the source code position of the log statement to the output.
+	AddSource bool
+
+	// ReplaceAttr is called to rewrite each non-group attribute before it is
+	// logged, see [slog.HandlerOptions].
+	ReplaceAttr func(groups []string, a slog.Attr) slog.Attr
+}
+
+// Handler is a [slog.Handler] that writes JSON records and adds key fields from
+// the AWS Lambda environment to every record.
 type Handler struct {
 	parent slog.Handler
 }
 
-// NewHandler creates a [Handler] that wraps handler and adds the service name,
-// function name and function memory size attributes, where set, since these
-// values do not change during the lifetime of the handler.
-func NewHandler(handler slog.Handler) *Handler {
+// NewHandler creates a [Handler] that writes JSON records to w and adds the
+// service name, function name and function memory size attributes, where set,
+// since these values do not change during the lifetime of the handler.
+func NewHandler(w io.Writer, opts *Options) *Handler {
+	if opts == nil {
+		opts = &Options{}
+	}
+	var handler slog.Handler = slog.NewJSONHandler(w, &slog.HandlerOptions{
+		AddSource:   opts.AddSource,
+		Level:       opts.Level,
+		ReplaceAttr: opts.ReplaceAttr,
+	})
+
 	var attrs []slog.Attr
 	for _, attr := range []slog.Attr{
 		getServiceName(),
