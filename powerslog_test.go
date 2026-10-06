@@ -29,6 +29,7 @@ type lambdaEnv struct {
 	traceHeader        string
 	lambdaLogLevel     string
 	powertoolsLogLevel string
+	sampleRate         string
 }
 
 func (e lambdaEnv) set(t *testing.T) {
@@ -39,6 +40,7 @@ func (e lambdaEnv) set(t *testing.T) {
 	t.Setenv("_X_AMZN_TRACE_ID", e.traceHeader)
 	t.Setenv("AWS_LAMBDA_LOG_LEVEL", e.lambdaLogLevel)
 	t.Setenv("POWERTOOLS_LOG_LEVEL", e.powertoolsLogLevel)
+	t.Setenv("POWERTOOLS_LOGGER_SAMPLE_RATE", e.sampleRate)
 }
 
 var fullLambdaEnv = lambdaEnv{
@@ -68,27 +70,34 @@ func decodeLines(t *testing.T, buf *bytes.Buffer) []map[string]any {
 }
 
 func TestHandlerConformance(t *testing.T) {
-	fullLambdaEnv.set(t)
+	sampledEnv := fullLambdaEnv
+	sampledEnv.sampleRate = "1"
 
-	var buf bytes.Buffer
-	slogtest.Run(t, func(*testing.T) slog.Handler {
-		buf.Reset()
-		return powerslog.NewHandler(&buf, nil)
-	}, func(t *testing.T) map[string]any {
-		records := decodeLines(t, &buf)
-		if len(records) != 1 {
-			t.Fatalf("got %d records, want 1", len(records))
-		}
-		// slogtest looks up the built-in slog keys.
-		record := records[0]
-		for from, to := range map[string]string{"timestamp": slog.TimeKey, "message": slog.MessageKey} {
-			if v, ok := record[from]; ok {
-				record[to] = v
-				delete(record, from)
-			}
-		}
-		return record
-	})
+	for name, env := range map[string]lambdaEnv{"default": fullLambdaEnv, "sampled": sampledEnv} {
+		t.Run(name, func(t *testing.T) {
+			env.set(t)
+
+			var buf bytes.Buffer
+			slogtest.Run(t, func(*testing.T) slog.Handler {
+				buf.Reset()
+				return powerslog.NewHandler(&buf, nil)
+			}, func(t *testing.T) map[string]any {
+				records := decodeLines(t, &buf)
+				if len(records) != 1 {
+					t.Fatalf("got %d records, want 1", len(records))
+				}
+				// slogtest looks up the built-in slog keys.
+				record := records[0]
+				for from, to := range map[string]string{"timestamp": slog.TimeKey, "message": slog.MessageKey} {
+					if v, ok := record[from]; ok {
+						record[to] = v
+						delete(record, from)
+					}
+				}
+				return record
+			})
+		})
+	}
 }
 
 func TestHandler(t *testing.T) {
@@ -926,4 +935,264 @@ func TestHandlerColdStartIsConcurrencySafe(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+func TestHandlerSampleRate(t *testing.T) {
+	tests := []struct {
+		name       string
+		env        lambdaEnv
+		sampleRate float64
+		want       any
+	}{
+		{
+			name: "no sample rate",
+			want: nil,
+		},
+		{
+			name:       "Options.SampleRate",
+			sampleRate: 0.5,
+			want:       0.5,
+		},
+		{
+			name:       "Options.SampleRate takes precedence over POWERTOOLS_LOGGER_SAMPLE_RATE",
+			env:        lambdaEnv{sampleRate: "0.25"},
+			sampleRate: 1,
+			want:       float64(1),
+		},
+		{
+			name: "POWERTOOLS_LOGGER_SAMPLE_RATE is used without Options.SampleRate",
+			env:  lambdaEnv{sampleRate: " 0.25 "},
+			want: 0.25,
+		},
+		{
+			name:       "out of range Options.SampleRate falls back to POWERTOOLS_LOGGER_SAMPLE_RATE",
+			env:        lambdaEnv{sampleRate: "0.25"},
+			sampleRate: 1.5,
+			want:       0.25,
+		},
+		{
+			name:       "negative Options.SampleRate falls back to POWERTOOLS_LOGGER_SAMPLE_RATE",
+			env:        lambdaEnv{sampleRate: "0.25"},
+			sampleRate: -0.5,
+			want:       0.25,
+		},
+		{
+			name: "invalid POWERTOOLS_LOGGER_SAMPLE_RATE is ignored",
+			env:  lambdaEnv{sampleRate: "often"},
+			want: nil,
+		},
+		{
+			name: "out of range POWERTOOLS_LOGGER_SAMPLE_RATE is ignored",
+			env:  lambdaEnv{sampleRate: "2"},
+			want: nil,
+		},
+		{
+			name: "NaN POWERTOOLS_LOGGER_SAMPLE_RATE is ignored",
+			env:  lambdaEnv{sampleRate: "NaN"},
+			want: nil,
+		},
+		{
+			name: "zero POWERTOOLS_LOGGER_SAMPLE_RATE is omitted",
+			env:  lambdaEnv{sampleRate: "0"},
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.env.set(t)
+
+			handler, buf := newTestHandler(t, &powerslog.Options{SampleRate: tt.sampleRate})
+			slog.New(handler.WithGroup("g")).Info("hello")
+
+			records := decodeLines(t, buf)
+			if len(records) != 1 {
+				t.Fatalf("got %d records, want 1", len(records))
+			}
+			got, ok := records[0]["sampling_rate"]
+			if tt.want == nil {
+				if ok {
+					t.Errorf("unexpected sampling_rate attribute %v", got)
+				}
+				return
+			}
+			if got != tt.want {
+				t.Errorf("sampling_rate = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHandlerSampling(t *testing.T) {
+	tests := []struct {
+		name       string
+		env        lambdaEnv
+		level      slog.Leveler
+		sampleRate float64
+		requestID  string
+		enabled    map[slog.Level]bool
+	}{
+		{
+			name:       "sample rate 1 enables debug",
+			sampleRate: 1,
+			requestID:  testRequestID,
+			enabled: map[slog.Level]bool{
+				powerslog.LevelTrace: false,
+				slog.LevelDebug:      true,
+				slog.LevelInfo:       true,
+			},
+		},
+		{
+			name:       "sample rate 1 enables debug above the minimum level",
+			level:      slog.LevelError,
+			sampleRate: 1,
+			requestID:  testRequestID,
+			enabled: map[slog.Level]bool{
+				powerslog.LevelTrace: false,
+				slog.LevelDebug:      true,
+				slog.LevelInfo:       true,
+				slog.LevelWarn:       true,
+				slog.LevelError:      true,
+			},
+		},
+		{
+			name:      "POWERTOOLS_LOGGER_SAMPLE_RATE enables debug",
+			env:       lambdaEnv{sampleRate: "1"},
+			requestID: testRequestID,
+			enabled: map[slog.Level]bool{
+				slog.LevelDebug: true,
+			},
+		},
+		{
+			name:      "sample rate 0 does not enable debug",
+			requestID: testRequestID,
+			enabled: map[slog.Level]bool{
+				slog.LevelDebug: false,
+				slog.LevelInfo:  true,
+			},
+		},
+		{
+			name:       "no request ID is not sampled",
+			sampleRate: 1,
+			enabled: map[slog.Level]bool{
+				slog.LevelDebug: false,
+				slog.LevelInfo:  true,
+			},
+		},
+		{
+			name:       "TRACE level is unchanged by sampling",
+			env:        lambdaEnv{lambdaLogLevel: "TRACE"},
+			sampleRate: 1,
+			requestID:  testRequestID,
+			enabled: map[slog.Level]bool{
+				powerslog.LevelTrace - 1: false,
+				powerslog.LevelTrace:     true,
+				slog.LevelDebug:          true,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.env.set(t)
+
+			handler, _ := newTestHandler(t, &powerslog.Options{
+				Level:      tt.level,
+				SampleRate: tt.sampleRate,
+			})
+			ctx := lambdaContext(t.Context(), tt.requestID, "")
+			handlers := map[string]slog.Handler{
+				"handler":   handler,
+				"WithAttrs": handler.WithAttrs([]slog.Attr{slog.String("k", "v")}),
+				"WithGroup": handler.WithGroup("g"),
+			}
+			for _, name := range slices.Sorted(maps.Keys(handlers)) {
+				for level, want := range tt.enabled {
+					if got := handlers[name].Enabled(ctx, level); got != want {
+						t.Errorf("%s: Enabled(%v) = %v, want %v", name, level, got, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestHandlerSamplingLogsDebug(t *testing.T) {
+	lambdaEnv{}.set(t)
+	powerslog.ResetColdStart()
+	t.Cleanup(powerslog.ResetColdStart)
+
+	handler, buf := newTestHandler(t, &powerslog.Options{
+		SampleRate:  1,
+		ReplaceAttr: removeTimeAttr(),
+	})
+	logger := slog.New(handler).WithGroup("g")
+	ctx := lambdaContext(t.Context(), testRequestID, "")
+	logger.DebugContext(ctx, "sampled")
+	logger.Debug("not sampled")
+
+	records := decodeLines(t, buf)
+	want := []map[string]any{{
+		"level":               "DEBUG",
+		"message":             "sampled",
+		"sampling_rate":       float64(1),
+		"function_request_id": testRequestID,
+		"function_arn":        testFunctionARN,
+		"cold_start":          true,
+	}}
+	if !reflect.DeepEqual(records, want) {
+		t.Errorf("got  %v\nwant %v", records, want)
+	}
+}
+
+func TestHandlerSamplingIsDeterministic(t *testing.T) {
+	lambdaEnv{}.set(t)
+
+	opts := &powerslog.Options{SampleRate: 0.5}
+	first := powerslog.NewHandler(io.Discard, opts)
+	second := powerslog.NewHandler(io.Discard, opts).WithGroup("g")
+
+	const n = 1000
+	sampled := 0
+	for i := range n {
+		ctx := lambdaContext(t.Context(), fmt.Sprintf("request-%d", i), "")
+		got := first.Enabled(ctx, slog.LevelDebug)
+		if again := first.Enabled(ctx, slog.LevelDebug); again != got {
+			t.Fatalf("request-%d: Enabled = %v then %v", i, got, again)
+		}
+		if other := second.Enabled(ctx, slog.LevelDebug); other != got {
+			t.Fatalf("request-%d: Enabled = %v, another handler = %v", i, got, other)
+		}
+		if got {
+			sampled++
+		}
+	}
+	if sampled < n*4/10 || sampled > n*6/10 {
+		t.Errorf("sampled %d of %d invocations at rate 0.5", sampled, n)
+	}
+}
+
+func TestHandlerSamplingLevelVar(t *testing.T) {
+	lambdaEnv{}.set(t)
+
+	var level slog.LevelVar
+	level.Set(slog.LevelError)
+	handler, _ := newTestHandler(t, &powerslog.Options{Level: &level, SampleRate: 1})
+	handler = handler.WithGroup("g")
+
+	sampled := lambdaContext(t.Context(), testRequestID, "")
+	if !handler.Enabled(sampled, slog.LevelDebug) {
+		t.Error("sampled: Enabled(DEBUG) = false, want true")
+	}
+	if handler.Enabled(t.Context(), slog.LevelInfo) {
+		t.Error("Enabled(INFO) at ERROR = true, want false")
+	}
+	level.Set(slog.LevelInfo)
+	if !handler.Enabled(t.Context(), slog.LevelInfo) {
+		t.Error("Enabled(INFO) after Set(INFO) = false, want true")
+	}
+	level.Set(powerslog.LevelTrace)
+	if !handler.Enabled(t.Context(), powerslog.LevelTrace) {
+		t.Error("Enabled(TRACE) after Set(TRACE) = false, want true")
+	}
 }

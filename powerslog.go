@@ -13,8 +13,10 @@ package powerslog
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"slices"
 	"strconv"
@@ -29,6 +31,7 @@ const (
 	envVarLambdaLogLevel        = "AWS_LAMBDA_LOG_LEVEL"
 	envVarLambdaMemorySize      = "AWS_LAMBDA_FUNCTION_MEMORY_SIZE"
 	envVarPowertoolsLogLevel    = "POWERTOOLS_LOG_LEVEL"
+	envVarPowertoolsSampleRate  = "POWERTOOLS_LOGGER_SAMPLE_RATE"
 	envVarPowertoolsServiceName = "POWERTOOLS_SERVICE_NAME"
 	envVarTraceID               = "_X_AMZN_TRACE_ID"
 
@@ -43,6 +46,7 @@ const (
 	attrKeyMemorySize   = "function_memory_size"
 	attrKeyMessage      = "message"
 	attrKeyRequestID    = "function_request_id"
+	attrKeySampleRate   = "sampling_rate"
 	attrKeyService      = "service"
 	attrKeyTimestamp    = "timestamp"
 	attrKeyTraceID      = "xray_trace_id"
@@ -66,6 +70,13 @@ type Options struct {
 	// Defaults to [slog.LevelInfo].
 	Level slog.Leveler
 
+	// SampleRate is the probability, from 0 to 1, that an invocation is
+	// sampled, which logs its debug records regardless of the level. The
+	// decision is made from the request ID, so it is the same for every
+	// record in an invocation. When SampleRate is 0 or outside [0, 1], the
+	// POWERTOOLS_LOGGER_SAMPLE_RATE environment variable is used.
+	SampleRate float64
+
 	// AddSource adds the source code position of the log statement to the output.
 	AddSource bool
 
@@ -83,10 +94,12 @@ type Handler struct {
 	// root with ops applied. When a record carries context fields, they are
 	// added to root and ops are replayed so that the fields are always at the
 	// top level, regardless of any groups.
-	root    slog.Handler
-	handler slog.Handler
-	ops     []handlerOp
-	cache   atomic.Pointer[cachedHandler]
+	root       slog.Handler
+	handler    slog.Handler
+	ops        []handlerOp
+	cache      atomic.Pointer[cachedHandler]
+	level      slog.Leveler
+	sampleRate float64
 }
 
 type handlerOp struct {
@@ -114,21 +127,28 @@ type cachedHandler struct {
 // added to each record from the context passed to the *Context logging
 // methods, such as [slog.Logger.InfoContext]. The X-Ray trace ID falls back
 // to the _X_AMZN_TRACE_ID environment variable when it is not in the context.
+//
+// When the sample rate is greater than 0, it is added to every record as the
+// sampling_rate attribute.
 func NewHandler(w io.Writer, opts *Options) *Handler {
 	if opts == nil {
 		opts = &Options{}
 	}
+	// Level gating is done by Handler.Enabled, so the JSON handler accepts
+	// records at every level.
 	var handler slog.Handler = slog.NewJSONHandler(w, &slog.HandlerOptions{
 		AddSource:   opts.AddSource,
-		Level:       resolveLevel(opts.Level),
+		Level:       slog.Level(math.MinInt),
 		ReplaceAttr: replaceAttr(opts.ReplaceAttr),
 	})
 
+	sampleRate := resolveSampleRate(opts.SampleRate)
 	var attrs []slog.Attr
 	for _, attr := range []slog.Attr{
 		getServiceName(),
 		getFunctionName(),
 		getFunctionMemorySize(),
+		getSampleRate(sampleRate),
 	} {
 		if !attr.Equal(slog.Attr{}) {
 			attrs = append(attrs, attr)
@@ -137,13 +157,48 @@ func NewHandler(w io.Writer, opts *Options) *Handler {
 	if len(attrs) > 0 {
 		handler = handler.WithAttrs(attrs)
 	}
-	return &Handler{root: handler, handler: handler}
+	return &Handler{
+		root:       handler,
+		handler:    handler,
+		level:      resolveLevel(opts.Level),
+		sampleRate: sampleRate,
+	}
 }
 
 // Enabled reports whether the handler handles records at the given level.
-// The handler ignores records whose level is lower.
+// The handler ignores records whose level is lower, except for debug records
+// in a sampled invocation.
 func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
-	return h.handler.Enabled(ctx, level)
+	if level >= h.level.Level() {
+		return true
+	}
+	return level >= slog.LevelDebug && h.sampleRate > 0 && h.sampled(ctx)
+}
+
+func (h *Handler) sampled(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	lc, ok := lambdacontext.FromContext(ctx)
+	if !ok || lc == nil || lc.AwsRequestID == "" {
+		return false
+	}
+	return sampleValue(lc.AwsRequestID) < h.sampleRate
+}
+
+// sampleValue maps a request ID to a value in [0, 1).
+func sampleValue(requestID string) float64 {
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(requestID))
+	// The FNV-1a high bits are poorly distributed for similar inputs, so
+	// they are mixed with the MurmurHash3 finaliser.
+	h := hash.Sum64()
+	h ^= h >> 33
+	h *= 0xff51afd7ed558ccd
+	h ^= h >> 33
+	h *= 0xc4ceb9fe1a85ec53
+	h ^= h >> 33
+	return float64(h>>11) / (1 << 53)
 }
 
 // Handle implements the slog.Handler interface and handles the Record.
@@ -176,9 +231,11 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 
 func (h *Handler) with(op handlerOp) *Handler {
 	return &Handler{
-		root:    h.root,
-		handler: op.apply(h.handler),
-		ops:     append(slices.Clip(h.ops), op),
+		root:       h.root,
+		handler:    op.apply(h.handler),
+		ops:        append(slices.Clip(h.ops), op),
+		level:      h.level,
+		sampleRate: h.sampleRate,
 	}
 }
 
@@ -280,6 +337,17 @@ func resolveLevel(level slog.Leveler) slog.Leveler {
 	return slog.LevelInfo
 }
 
+func resolveSampleRate(rate float64) float64 {
+	if rate > 0 && rate <= 1 {
+		return rate
+	}
+	rate, err := strconv.ParseFloat(strings.TrimSpace(os.Getenv(envVarPowertoolsSampleRate)), 64)
+	if err != nil || math.IsNaN(rate) || rate < 0 || rate > 1 {
+		return 0
+	}
+	return rate
+}
+
 func parseLevel(s string) (slog.Level, bool) {
 	switch strings.ToUpper(strings.TrimSpace(s)) {
 	case "TRACE":
@@ -363,6 +431,13 @@ func getFunctionMemorySize() slog.Attr {
 		Key:   attrKeyMemorySize,
 		Value: slog.IntValue(memorySize),
 	}
+}
+
+func getSampleRate(rate float64) slog.Attr {
+	if rate == 0 {
+		return slog.Attr{}
+	}
+	return slog.Float64(attrKeySampleRate, rate)
 }
 
 func getFunctionName() slog.Attr {
