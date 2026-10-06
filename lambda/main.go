@@ -11,24 +11,22 @@ import (
 	"github.com/unfunco/powerslog"
 )
 
-type contextKey string
+func newHandler(logger *slog.Logger) func(context.Context, events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	return func(ctx context.Context, event events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+		logger.InfoContext(ctx, "Request received",
+			slog.String("method", event.HTTPMethod),
+			slog.String("resource", event.Resource),
+		)
 
-const loggerContextKey contextKey = "logger"
-
-func handler(ctx context.Context, event events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
-	logger := ctx.Value(loggerContextKey).(*slog.Logger)
-	logger.Info("Request received", slog.Any("event", event))
-
-	return events.APIGatewayProxyResponse{
-		StatusCode: http.StatusNoContent,
-	}, nil
+		return events.APIGatewayProxyResponse{
+			StatusCode: http.StatusNoContent,
+		}, nil
+	}
 }
 
 func main() {
 	jsonHandler := slog.NewJSONHandler(os.Stdout, nil)
-	powerslogHandler := powerslog.NewHandler(jsonHandler)
-	logger := slog.New(powerslogHandler)
+	logger := slog.New(powerslog.NewHandler(jsonHandler))
 
-	ctx := context.WithValue(context.Background(), loggerContextKey, logger)
-	lambda.StartWithOptions(handler, lambda.WithContext(ctx))
+	lambda.Start(newHandler(logger))
 }

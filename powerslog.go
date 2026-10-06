@@ -22,24 +22,30 @@ const (
 	attrKeyService      = "service"
 )
 
-// Handler is a [slog.Handler] that writes Records that include key fields from
-// an AWS Lambda context to an [io.Writer].
+// Handler is a [slog.Handler] that wraps a parent handler and adds key fields
+// from the AWS Lambda environment to every record.
 type Handler struct {
 	parent slog.Handler
 }
 
-// NewHandler creates a [Handler] that writes to w, using the given options.
-// It adds the service name and function name to the attributes of the
-// log record during handler construction since these values are not going to
-// change during the lifetime of the handler.
+// NewHandler creates a [Handler] that wraps handler and adds the service name,
+// function name and function memory size attributes, where set, since these
+// values do not change during the lifetime of the handler.
 func NewHandler(handler slog.Handler) *Handler {
-	return &Handler{
-		parent: handler.WithAttrs([]slog.Attr{
-			getServiceName(),
-			getFunctionName(),
-			getFunctionMemorySize(),
-		}),
+	var attrs []slog.Attr
+	for _, attr := range []slog.Attr{
+		getServiceName(),
+		getFunctionName(),
+		getFunctionMemorySize(),
+	} {
+		if !attr.Equal(slog.Attr{}) {
+			attrs = append(attrs, attr)
+		}
 	}
+	if len(attrs) > 0 {
+		handler = handler.WithAttrs(attrs)
+	}
+	return &Handler{parent: handler}
 }
 
 // Enabled reports whether the handler handles records at the given level.

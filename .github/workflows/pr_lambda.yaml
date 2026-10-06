@@ -5,7 +5,10 @@ on:
     branches:
     - main
     paths:
+    - "*.go"
     - .github/workflows/pr_lambda.yaml
+    - go.mod
+    - go.sum
     - lambda/**/*
 
 jobs:
