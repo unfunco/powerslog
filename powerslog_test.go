@@ -2,7 +2,9 @@ package powerslog_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"maps"
 	"reflect"
@@ -10,10 +12,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"testing/slogtest"
 	"time"
 
+	"github.com/aws/aws-lambda-go/lambdacontext"
 	"github.com/unfunco/powerslog"
 )
 
@@ -21,6 +25,7 @@ type lambdaEnv struct {
 	functionName string
 	memorySize   string
 	serviceName  string
+	traceHeader  string
 }
 
 func (e lambdaEnv) set(t *testing.T) {
@@ -28,6 +33,7 @@ func (e lambdaEnv) set(t *testing.T) {
 	t.Setenv("AWS_LAMBDA_FUNCTION_NAME", e.functionName)
 	t.Setenv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", e.memorySize)
 	t.Setenv("POWERTOOLS_SERVICE_NAME", e.serviceName)
+	t.Setenv("_X_AMZN_TRACE_ID", e.traceHeader)
 }
 
 var fullLambdaEnv = lambdaEnv{
@@ -512,4 +518,238 @@ func TestHandlerReplaceAttrSeesPowertoolsNames(t *testing.T) {
 	if got := records[0]["message"]; got != "replaced" {
 		t.Errorf("message = %v, want replaced", got)
 	}
+}
+
+const (
+	testRequestID   = "c6af9ac6-7b61-11e6-9a41-93e812345678"
+	testFunctionARN = "arn:aws:lambda:eu-west-2:123456789012:function:test-function"
+	testTraceHeader = "Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1"
+	testTraceID     = "1-5759e988-bd862e3fe1be46a994272793"
+)
+
+func lambdaContext(ctx context.Context, requestID, traceHeader string) context.Context {
+	ctx = lambdacontext.NewContext(ctx, &lambdacontext.LambdaContext{
+		AwsRequestID:       requestID,
+		InvokedFunctionArn: testFunctionARN,
+	})
+	if traceHeader != "" {
+		// aws-lambda-go stores the trace header under a plain string key.
+		ctx = context.WithValue(ctx, "x-amzn-trace-id", traceHeader) //nolint:staticcheck
+	}
+	return ctx
+}
+
+func TestHandlerContextFields(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   lambdaEnv
+		ctx   func(context.Context) context.Context
+		apply func(slog.Handler) slog.Handler
+		want  map[string]any
+	}{
+		{
+			name: "Lambda context and trace header",
+			ctx: func(ctx context.Context) context.Context {
+				return lambdaContext(ctx, testRequestID, testTraceHeader)
+			},
+			want: map[string]any{
+				"level":               "INFO",
+				"message":             "hello",
+				"function_request_id": testRequestID,
+				"function_arn":        testFunctionARN,
+				"cold_start":          true,
+				"xray_trace_id":       testTraceID,
+			},
+		},
+		{
+			name: "trace header falls back to the environment",
+			env:  lambdaEnv{traceHeader: testTraceHeader},
+			ctx: func(ctx context.Context) context.Context {
+				return lambdaContext(ctx, testRequestID, "")
+			},
+			want: map[string]any{
+				"level":               "INFO",
+				"message":             "hello",
+				"function_request_id": testRequestID,
+				"function_arn":        testFunctionARN,
+				"cold_start":          true,
+				"xray_trace_id":       testTraceID,
+			},
+		},
+		{
+			name: "trace header in the context takes precedence",
+			env:  lambdaEnv{traceHeader: "Root=1-00000000-000000000000000000000000"},
+			ctx: func(ctx context.Context) context.Context {
+				return lambdaContext(ctx, testRequestID, testTraceHeader)
+			},
+			want: map[string]any{
+				"level":               "INFO",
+				"message":             "hello",
+				"function_request_id": testRequestID,
+				"function_arn":        testFunctionARN,
+				"cold_start":          true,
+				"xray_trace_id":       testTraceID,
+			},
+		},
+		{
+			name: "trace header from the environment without a Lambda context",
+			env:  lambdaEnv{traceHeader: testTraceHeader},
+			want: map[string]any{
+				"level":         "INFO",
+				"message":       "hello",
+				"xray_trace_id": testTraceID,
+			},
+		},
+		{
+			name: "fields are absent without a Lambda context",
+			want: map[string]any{
+				"level":   "INFO",
+				"message": "hello",
+			},
+		},
+		{
+			name: "empty request ID omits the request ID and cold start",
+			ctx: func(ctx context.Context) context.Context {
+				return lambdaContext(ctx, "", "Parent=53995c3f42cd8ad8;Sampled=1")
+			},
+			want: map[string]any{
+				"level":        "INFO",
+				"message":      "hello",
+				"function_arn": testFunctionARN,
+			},
+		},
+		{
+			name: "WithGroup keeps context fields at the top level",
+			env:  fullLambdaEnv,
+			ctx: func(ctx context.Context) context.Context {
+				return lambdaContext(ctx, testRequestID, testTraceHeader)
+			},
+			apply: func(h slog.Handler) slog.Handler {
+				return h.WithAttrs([]slog.Attr{slog.String("user", "alice")}).
+					WithGroup("request").
+					WithAttrs([]slog.Attr{slog.String("id", "abc")}).
+					WithGroup("empty")
+			},
+			want: map[string]any{
+				"level":                "INFO",
+				"message":              "hello",
+				"service":              "test-service",
+				"function_name":        "test-function",
+				"function_memory_size": float64(128),
+				"function_request_id":  testRequestID,
+				"function_arn":         testFunctionARN,
+				"cold_start":           true,
+				"xray_trace_id":        testTraceID,
+				"user":                 "alice",
+				"request":              map[string]any{"id": "abc"},
+			},
+		},
+		{
+			name: "WithAttrs preserves context fields",
+			ctx: func(ctx context.Context) context.Context {
+				return lambdaContext(ctx, testRequestID, testTraceHeader)
+			},
+			apply: func(h slog.Handler) slog.Handler {
+				return h.WithAttrs([]slog.Attr{slog.String("user", "alice")})
+			},
+			want: map[string]any{
+				"level":               "INFO",
+				"message":             "hello",
+				"function_request_id": testRequestID,
+				"function_arn":        testFunctionARN,
+				"cold_start":          true,
+				"xray_trace_id":       testTraceID,
+				"user":                "alice",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.env.set(t)
+			powerslog.ResetColdStart()
+			t.Cleanup(powerslog.ResetColdStart)
+
+			handler, buf := newTestHandler(t, &powerslog.Options{
+				ReplaceAttr: removeTimeAttr(),
+			})
+			if tt.apply != nil {
+				handler = tt.apply(handler)
+			}
+			ctx := t.Context()
+			if tt.ctx != nil {
+				ctx = tt.ctx(ctx)
+			}
+			slog.New(handler).InfoContext(ctx, "hello")
+
+			records := decodeLines(t, buf)
+			if len(records) != 1 {
+				t.Fatalf("got %d records, want 1", len(records))
+			}
+			if !reflect.DeepEqual(records[0], tt.want) {
+				t.Errorf("got  %v\nwant %v", records[0], tt.want)
+			}
+		})
+	}
+}
+
+func TestHandlerColdStart(t *testing.T) {
+	lambdaEnv{}.set(t)
+	powerslog.ResetColdStart()
+	t.Cleanup(powerslog.ResetColdStart)
+
+	handler, buf := newTestHandler(t, nil)
+	logger := slog.New(handler).With(slog.String("user", "alice"))
+
+	first := lambdaContext(t.Context(), "first-request", testTraceHeader)
+	second := lambdaContext(t.Context(), "second-request", testTraceHeader)
+	logger.InfoContext(first, "hello")
+	logger.InfoContext(first, "hello")
+	logger.InfoContext(second, "hello")
+	logger.InfoContext(first, "hello")
+	logger.Info("hello")
+
+	records := decodeLines(t, buf)
+	want := []struct {
+		requestID any
+		coldStart any
+	}{
+		{"first-request", true},
+		{"first-request", true},
+		{"second-request", false},
+		{"first-request", true},
+		{nil, nil},
+	}
+	if len(records) != len(want) {
+		t.Fatalf("got %d records, want %d", len(records), len(want))
+	}
+	for i, w := range want {
+		if got := records[i]["function_request_id"]; got != w.requestID {
+			t.Errorf("record %d: function_request_id = %v, want %v", i, got, w.requestID)
+		}
+		if got := records[i]["cold_start"]; got != w.coldStart {
+			t.Errorf("record %d: cold_start = %v, want %v", i, got, w.coldStart)
+		}
+		if got := records[i]["user"]; got != "alice" {
+			t.Errorf("record %d: user = %v, want alice", i, got)
+		}
+	}
+}
+
+func TestHandlerColdStartIsConcurrencySafe(t *testing.T) {
+	lambdaEnv{}.set(t)
+	powerslog.ResetColdStart()
+	t.Cleanup(powerslog.ResetColdStart)
+
+	handler := powerslog.NewHandler(io.Discard, nil)
+	logger := slog.New(handler.WithGroup("g"))
+
+	var wg sync.WaitGroup
+	for i := range 32 {
+		wg.Go(func() {
+			ctx := lambdaContext(context.Background(), "request-"+strconv.Itoa(i%4), testTraceHeader)
+			logger.InfoContext(ctx, "hello", slog.Int("i", i))
+		})
+	}
+	wg.Wait()
 }
