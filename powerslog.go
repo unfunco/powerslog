@@ -12,6 +12,7 @@ package powerslog
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -25,7 +26,9 @@ import (
 
 const (
 	envVarLambdaFunctionName    = "AWS_LAMBDA_FUNCTION_NAME"
+	envVarLambdaLogLevel        = "AWS_LAMBDA_LOG_LEVEL"
 	envVarLambdaMemorySize      = "AWS_LAMBDA_FUNCTION_MEMORY_SIZE"
+	envVarPowertoolsLogLevel    = "POWERTOOLS_LOG_LEVEL"
 	envVarPowertoolsServiceName = "POWERTOOLS_SERVICE_NAME"
 	envVarTraceID               = "_X_AMZN_TRACE_ID"
 
@@ -47,10 +50,20 @@ const (
 	timestampFormat = "2006-01-02T15:04:05.000Z"
 )
 
+// Levels in addition to those defined by slog, matching the TRACE and FATAL
+// levels supported by Lambda and the Powertools loggers.
+const (
+	LevelTrace slog.Level = slog.LevelDebug - 4
+	LevelFatal slog.Level = slog.LevelError + 4
+)
+
 // Options configures a [Handler]. A nil *Options is equivalent to the zero
 // value.
 type Options struct {
-	// Level is the minimum level of records to log. Defaults to [slog.LevelInfo].
+	// Level is the minimum level of records to log. The AWS_LAMBDA_LOG_LEVEL
+	// environment variable takes precedence over Level, and the
+	// POWERTOOLS_LOG_LEVEL environment variable is used when Level is nil.
+	// Defaults to [slog.LevelInfo].
 	Level slog.Leveler
 
 	// AddSource adds the source code position of the log statement to the output.
@@ -107,7 +120,7 @@ func NewHandler(w io.Writer, opts *Options) *Handler {
 	}
 	var handler slog.Handler = slog.NewJSONHandler(w, &slog.HandlerOptions{
 		AddSource:   opts.AddSource,
-		Level:       opts.Level,
+		Level:       resolveLevel(opts.Level),
 		ReplaceAttr: replaceAttr(opts.ReplaceAttr),
 	})
 
@@ -254,6 +267,55 @@ func resetColdStart() {
 	coldStartRequestID.Store(nil)
 }
 
+func resolveLevel(level slog.Leveler) slog.Leveler {
+	if l, ok := parseLevel(os.Getenv(envVarLambdaLogLevel)); ok {
+		return l
+	}
+	if level != nil {
+		return level
+	}
+	if l, ok := parseLevel(os.Getenv(envVarPowertoolsLogLevel)); ok {
+		return l
+	}
+	return slog.LevelInfo
+}
+
+func parseLevel(s string) (slog.Level, bool) {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "TRACE":
+		return LevelTrace, true
+	case "DEBUG":
+		return slog.LevelDebug, true
+	case "INFO":
+		return slog.LevelInfo, true
+	case "WARN", "WARNING":
+		return slog.LevelWarn, true
+	case "ERROR":
+		return slog.LevelError, true
+	case "FATAL":
+		return LevelFatal, true
+	}
+	return 0, false
+}
+
+// levelName names the levels that slog would otherwise name relative to
+// DEBUG or ERROR, such as DEBUG-4 and ERROR+4.
+func levelName(l slog.Level) (string, bool) {
+	name := func(base string, offset slog.Level) string {
+		if offset == 0 {
+			return base
+		}
+		return fmt.Sprintf("%s%+d", base, int(offset))
+	}
+	switch {
+	case l < slog.LevelDebug:
+		return name("TRACE", l-LevelTrace), true
+	case l >= LevelFatal:
+		return name("FATAL", l-LevelFatal), true
+	}
+	return "", false
+}
+
 func replaceAttr(next func([]string, slog.Attr) slog.Attr) func([]string, slog.Attr) slog.Attr {
 	return func(groups []string, a slog.Attr) slog.Attr {
 		if len(groups) == 0 {
@@ -271,6 +333,12 @@ func renameBuiltin(a slog.Attr) slog.Attr {
 	case slog.TimeKey:
 		if a.Value.Kind() == slog.KindTime {
 			return slog.String(attrKeyTimestamp, a.Value.Time().UTC().Format(timestampFormat))
+		}
+	case slog.LevelKey:
+		if level, ok := a.Value.Any().(slog.Level); ok {
+			if name, ok := levelName(level); ok {
+				return slog.String(slog.LevelKey, name)
+			}
 		}
 	case slog.MessageKey:
 		return slog.Attr{Key: attrKeyMessage, Value: a.Value}

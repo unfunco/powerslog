@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"maps"
@@ -22,10 +23,12 @@ import (
 )
 
 type lambdaEnv struct {
-	functionName string
-	memorySize   string
-	serviceName  string
-	traceHeader  string
+	functionName       string
+	memorySize         string
+	serviceName        string
+	traceHeader        string
+	lambdaLogLevel     string
+	powertoolsLogLevel string
 }
 
 func (e lambdaEnv) set(t *testing.T) {
@@ -34,6 +37,8 @@ func (e lambdaEnv) set(t *testing.T) {
 	t.Setenv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", e.memorySize)
 	t.Setenv("POWERTOOLS_SERVICE_NAME", e.serviceName)
 	t.Setenv("_X_AMZN_TRACE_ID", e.traceHeader)
+	t.Setenv("AWS_LAMBDA_LOG_LEVEL", e.lambdaLogLevel)
+	t.Setenv("POWERTOOLS_LOG_LEVEL", e.powertoolsLogLevel)
 }
 
 var fullLambdaEnv = lambdaEnv{
@@ -243,6 +248,175 @@ func TestHandlerEnabled(t *testing.T) {
 						t.Errorf("%s: Enabled(%v) = %v, want %v", name, level, got, want)
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestHandlerLevel(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   lambdaEnv
+		level slog.Leveler
+		want  slog.Level
+	}{
+		{
+			name: "defaults to INFO",
+			want: slog.LevelInfo,
+		},
+		{
+			name: "POWERTOOLS_LOG_LEVEL is used without Options.Level",
+			env:  lambdaEnv{powertoolsLogLevel: "DEBUG"},
+			want: slog.LevelDebug,
+		},
+		{
+			name:  "Options.Level takes precedence over POWERTOOLS_LOG_LEVEL",
+			env:   lambdaEnv{powertoolsLogLevel: "DEBUG"},
+			level: slog.LevelError,
+			want:  slog.LevelError,
+		},
+		{
+			name:  "AWS_LAMBDA_LOG_LEVEL takes precedence over Options.Level",
+			env:   lambdaEnv{lambdaLogLevel: "WARN", powertoolsLogLevel: "DEBUG"},
+			level: slog.LevelDebug,
+			want:  slog.LevelWarn,
+		},
+		{
+			name: "AWS_LAMBDA_LOG_LEVEL takes precedence over POWERTOOLS_LOG_LEVEL",
+			env:  lambdaEnv{lambdaLogLevel: "ERROR", powertoolsLogLevel: "DEBUG"},
+			want: slog.LevelError,
+		},
+		{
+			name: "level names are case-insensitive and trimmed",
+			env:  lambdaEnv{powertoolsLogLevel: " dEbUg "},
+			want: slog.LevelDebug,
+		},
+		{
+			name: "WARNING is an alias for WARN",
+			env:  lambdaEnv{lambdaLogLevel: "warning"},
+			want: slog.LevelWarn,
+		},
+		{
+			name: "TRACE",
+			env:  lambdaEnv{lambdaLogLevel: "TRACE"},
+			want: powerslog.LevelTrace,
+		},
+		{
+			name: "FATAL",
+			env:  lambdaEnv{powertoolsLogLevel: "FATAL"},
+			want: powerslog.LevelFatal,
+		},
+		{
+			name:  "unknown AWS_LAMBDA_LOG_LEVEL falls through to Options.Level",
+			env:   lambdaEnv{lambdaLogLevel: "VERBOSE"},
+			level: slog.LevelError,
+			want:  slog.LevelError,
+		},
+		{
+			name: "unknown AWS_LAMBDA_LOG_LEVEL falls through to POWERTOOLS_LOG_LEVEL",
+			env:  lambdaEnv{lambdaLogLevel: "VERBOSE", powertoolsLogLevel: "WARN"},
+			want: slog.LevelWarn,
+		},
+		{
+			name: "unknown POWERTOOLS_LOG_LEVEL falls back to INFO",
+			env:  lambdaEnv{powertoolsLogLevel: "VERBOSE"},
+			want: slog.LevelInfo,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.env.set(t)
+
+			handler, _ := newTestHandler(t, &powerslog.Options{Level: tt.level})
+			if !handler.Enabled(t.Context(), tt.want) {
+				t.Errorf("Enabled(%v) = false, want true", tt.want)
+			}
+			if handler.Enabled(t.Context(), tt.want-1) {
+				t.Errorf("Enabled(%v) = true, want false", tt.want-1)
+			}
+		})
+	}
+}
+
+func TestHandlerLevelVar(t *testing.T) {
+	tests := []struct {
+		name string
+		env  lambdaEnv
+		want map[slog.Level]bool
+	}{
+		{
+			name: "LevelVar remains dynamic",
+			env:  lambdaEnv{powertoolsLogLevel: "INFO"},
+			want: map[slog.Level]bool{slog.LevelError: true, slog.LevelDebug: true},
+		},
+		{
+			name: "AWS_LAMBDA_LOG_LEVEL takes precedence over a LevelVar",
+			env:  lambdaEnv{lambdaLogLevel: "WARN"},
+			want: map[slog.Level]bool{slog.LevelError: true, slog.LevelDebug: false},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.env.set(t)
+
+			var level slog.LevelVar
+			level.Set(slog.LevelError)
+			handler, _ := newTestHandler(t, &powerslog.Options{Level: &level})
+			handler = handler.WithGroup("g")
+			for _, l := range slices.Sorted(maps.Keys(tt.want)) {
+				level.Set(l)
+				if got := handler.Enabled(t.Context(), l); got != tt.want[l] {
+					t.Errorf("Enabled(%v) after Set(%v) = %v, want %v", l, l, got, tt.want[l])
+				}
+			}
+		})
+	}
+}
+
+func TestHandlerLevelNames(t *testing.T) {
+	tests := []struct {
+		level slog.Level
+		want  string
+	}{
+		{powerslog.LevelTrace - 1, "TRACE-1"},
+		{powerslog.LevelTrace, "TRACE"},
+		{powerslog.LevelTrace + 1, "TRACE+1"},
+		{slog.LevelDebug, "DEBUG"},
+		{slog.LevelInfo, "INFO"},
+		{slog.LevelWarn, "WARN"},
+		{slog.LevelError, "ERROR"},
+		{slog.LevelError + 1, "ERROR+1"},
+		{powerslog.LevelFatal, "FATAL"},
+		{powerslog.LevelFatal + 2, "FATAL+2"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			lambdaEnv{}.set(t)
+
+			var replaced any
+			handler, buf := newTestHandler(t, &powerslog.Options{
+				Level: slog.Level(-100),
+				ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+					if a.Key == slog.LevelKey && len(groups) == 0 {
+						replaced = a.Value.Any()
+					}
+					return a
+				},
+			})
+			slog.New(handler).Log(t.Context(), tt.level, "hello")
+
+			records := decodeLines(t, buf)
+			if len(records) != 1 {
+				t.Fatalf("got %d records, want 1", len(records))
+			}
+			if got := records[0]["level"]; got != tt.want {
+				t.Errorf("level = %v, want %v", got, tt.want)
+			}
+			if got := fmt.Sprint(replaced); got != tt.want {
+				t.Errorf("ReplaceAttr saw level %v, want %v", got, tt.want)
 			}
 		})
 	}
