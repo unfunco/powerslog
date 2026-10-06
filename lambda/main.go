@@ -25,8 +25,7 @@ func newHandler(logger *slog.Logger) func(context.Context, events.APIGatewayProx
 }
 
 func main() {
-	jsonHandler := slog.NewJSONHandler(os.Stdout, nil)
-	logger := slog.New(powerslog.NewHandler(jsonHandler))
+	logger := slog.New(powerslog.NewHandler(os.Stdout, nil))
 
 	lambda.Start(newHandler(logger))
 }

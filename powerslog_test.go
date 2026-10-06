@@ -7,6 +7,7 @@ import (
 	"maps"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"testing/slogtest"
 
@@ -32,10 +33,10 @@ var fullLambdaEnv = lambdaEnv{
 	serviceName:  "test-service",
 }
 
-func newTestHandler(t *testing.T, opts *slog.HandlerOptions) (slog.Handler, *bytes.Buffer) {
+func newTestHandler(t *testing.T, opts *powerslog.Options) (slog.Handler, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
-	return powerslog.NewHandler(slog.NewJSONHandler(&buf, opts)), &buf
+	return powerslog.NewHandler(&buf, opts), &buf
 }
 
 func decodeLines(t *testing.T, buf *bytes.Buffer) []map[string]any {
@@ -58,7 +59,7 @@ func TestHandlerConformance(t *testing.T) {
 	var buf bytes.Buffer
 	slogtest.Run(t, func(*testing.T) slog.Handler {
 		buf.Reset()
-		return powerslog.NewHandler(slog.NewJSONHandler(&buf, nil))
+		return powerslog.NewHandler(&buf, nil)
 	}, func(t *testing.T) map[string]any {
 		records := decodeLines(t, &buf)
 		if len(records) != 1 {
@@ -146,7 +147,7 @@ func TestHandler(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.env.set(t)
 
-			handler, buf := newTestHandler(t, &slog.HandlerOptions{
+			handler, buf := newTestHandler(t, &powerslog.Options{
 				ReplaceAttr: removeTimeAttr(),
 			})
 			if tt.apply != nil {
@@ -213,7 +214,7 @@ func TestHandlerEnabled(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			fullLambdaEnv.set(t)
 
-			handler, _ := newTestHandler(t, &slog.HandlerOptions{Level: tt.level})
+			handler, _ := newTestHandler(t, &powerslog.Options{Level: tt.level})
 			handlers := map[string]slog.Handler{
 				"handler":   handler,
 				"WithAttrs": handler.WithAttrs([]slog.Attr{slog.String("k", "v")}),
@@ -226,6 +227,99 @@ func TestHandlerEnabled(t *testing.T) {
 					}
 				}
 			}
+		})
+	}
+}
+
+func TestHandlerOptions(t *testing.T) {
+	tests := []struct {
+		name  string
+		opts  *powerslog.Options
+		check func(t *testing.T, records []map[string]any)
+	}{
+		{
+			name: "nil options default to INFO",
+			opts: nil,
+			check: func(t *testing.T, records []map[string]any) {
+				if len(records) != 1 {
+					t.Fatalf("got %d records, want 1", len(records))
+				}
+				if got := records[0]["level"]; got != "INFO" {
+					t.Errorf("level = %v, want INFO", got)
+				}
+				if _, ok := records[0]["time"]; !ok {
+					t.Error("time attribute missing")
+				}
+				if _, ok := records[0]["source"]; ok {
+					t.Error("unexpected source attribute")
+				}
+			},
+		},
+		{
+			name: "Level is honoured",
+			opts: &powerslog.Options{Level: slog.LevelDebug},
+			check: func(t *testing.T, records []map[string]any) {
+				if len(records) != 2 {
+					t.Fatalf("got %d records, want 2", len(records))
+				}
+				if got := records[0]["level"]; got != "DEBUG" {
+					t.Errorf("level = %v, want DEBUG", got)
+				}
+			},
+		},
+		{
+			name: "AddSource is honoured",
+			opts: &powerslog.Options{AddSource: true},
+			check: func(t *testing.T, records []map[string]any) {
+				if len(records) != 1 {
+					t.Fatalf("got %d records, want 1", len(records))
+				}
+				source, ok := records[0]["source"].(map[string]any)
+				if !ok {
+					t.Fatalf("source = %v, want an object", records[0]["source"])
+				}
+				if file, _ := source["file"].(string); !strings.HasSuffix(file, "powerslog_test.go") {
+					t.Errorf("source file = %q, want suffix powerslog_test.go", file)
+				}
+			},
+		},
+		{
+			name: "ReplaceAttr is honoured",
+			opts: &powerslog.Options{
+				ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+					switch a.Key {
+					case slog.TimeKey:
+						return slog.Attr{}
+					case "service":
+						return slog.String("service", "replaced")
+					}
+					return a
+				},
+			},
+			check: func(t *testing.T, records []map[string]any) {
+				if len(records) != 1 {
+					t.Fatalf("got %d records, want 1", len(records))
+				}
+				if _, ok := records[0]["time"]; ok {
+					t.Error("time attribute not removed")
+				}
+				if got := records[0]["service"]; got != "replaced" {
+					t.Errorf("service = %v, want replaced", got)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fullLambdaEnv.set(t)
+
+			handler, buf := newTestHandler(t, tt.opts)
+			logger := slog.New(handler)
+			logger.Debug("debug")
+			logger.Info("info")
+
+			tt.check(t, decodeLines(t, buf))
 		})
 	}
 }
