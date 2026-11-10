@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.1](https://github.com/unfunco/powerslog/compare/v0.2.0...v0.2.1) (2026-11-10)
+
+
+### Bug fixes
+
+* Correct cold start, attribute renaming and level names ([#23](https://github.com/unfunco/powerslog/issues/23)) ([1b1fb10](https://github.com/unfunco/powerslog/commit/1b1fb10c8aa035e9237605d6c2343bd90fe239ef))
+
+
+### Miscellaneous
+
+* Adopt Meta v0.4.1 workflows ([#22](https://github.com/unfunco/powerslog/issues/22)) ([fe76e08](https://github.com/unfunco/powerslog/commit/fe76e08d4c02d2432f8bee6f49800466007d2cc1))
+* Lock GitHub Actions workflow dependencies ([#19](https://github.com/unfunco/powerslog/issues/19)) ([fa00db2](https://github.com/unfunco/powerslog/commit/fa00db2ace95d450d47548e9687a9bb7f8e2da26))
+
 ## [0.2.0](https://github.com/unfunco/powerslog/compare/v0.1.0...v0.2.0) (2026-10-06)
 
 
