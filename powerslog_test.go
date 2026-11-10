@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"math"
 	"reflect"
 	"runtime"
 	"slices"
@@ -32,15 +33,15 @@ type lambdaEnv struct {
 	sampleRate         string
 }
 
-func (e lambdaEnv) set(t *testing.T) {
-	t.Helper()
-	t.Setenv("AWS_LAMBDA_FUNCTION_NAME", e.functionName)
-	t.Setenv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", e.memorySize)
-	t.Setenv("POWERTOOLS_SERVICE_NAME", e.serviceName)
-	t.Setenv("_X_AMZN_TRACE_ID", e.traceHeader)
-	t.Setenv("AWS_LAMBDA_LOG_LEVEL", e.lambdaLogLevel)
-	t.Setenv("POWERTOOLS_LOG_LEVEL", e.powertoolsLogLevel)
-	t.Setenv("POWERTOOLS_LOGGER_SAMPLE_RATE", e.sampleRate)
+func (e lambdaEnv) set(tb testing.TB) {
+	tb.Helper()
+	tb.Setenv("AWS_LAMBDA_FUNCTION_NAME", e.functionName)
+	tb.Setenv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", e.memorySize)
+	tb.Setenv("POWERTOOLS_SERVICE_NAME", e.serviceName)
+	tb.Setenv("_X_AMZN_TRACE_ID", e.traceHeader)
+	tb.Setenv("AWS_LAMBDA_LOG_LEVEL", e.lambdaLogLevel)
+	tb.Setenv("POWERTOOLS_LOG_LEVEL", e.powertoolsLogLevel)
+	tb.Setenv("POWERTOOLS_LOGGER_SAMPLE_RATE", e.sampleRate)
 }
 
 var fullLambdaEnv = lambdaEnv{
@@ -69,25 +70,66 @@ func decodeLines(t *testing.T, buf *bytes.Buffer) []map[string]any {
 	return records
 }
 
+// contextHandler handles every record with ctx in place of the context it was
+// logged with, so that records logged without one carry the context fields.
+type contextHandler struct {
+	slog.Handler
+	ctx context.Context
+}
+
+func (h contextHandler) Handle(_ context.Context, record slog.Record) error {
+	return h.Handler.Handle(h.ctx, record)
+}
+
+func (h contextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return contextHandler{Handler: h.Handler.WithAttrs(attrs), ctx: h.ctx}
+}
+
+func (h contextHandler) WithGroup(name string) slog.Handler {
+	return contextHandler{Handler: h.Handler.WithGroup(name), ctx: h.ctx}
+}
+
 func TestHandlerConformance(t *testing.T) {
 	sampledEnv := fullLambdaEnv
 	sampledEnv.sampleRate = "1"
 
-	for name, env := range map[string]lambdaEnv{"default": fullLambdaEnv, "sampled": sampledEnv} {
-		t.Run(name, func(t *testing.T) {
-			env.set(t)
+	tests := []struct {
+		name          string
+		env           lambdaEnv
+		contextFields bool
+	}{
+		{name: "default", env: fullLambdaEnv},
+		{name: "sampled", env: sampledEnv},
+		{name: "context fields", env: fullLambdaEnv, contextFields: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.env.set(t)
+			powerslog.ResetColdStart()
+			t.Cleanup(powerslog.ResetColdStart)
 
 			var buf bytes.Buffer
-			slogtest.Run(t, func(*testing.T) slog.Handler {
+			slogtest.Run(t, func(t *testing.T) slog.Handler {
 				buf.Reset()
-				return powerslog.NewHandler(&buf, nil)
+				handler := powerslog.NewHandler(&buf, nil)
+				if !tt.contextFields {
+					return handler
+				}
+				return contextHandler{
+					Handler: handler,
+					ctx:     lambdaContext(t.Context(), testRequestID, testTraceHeader),
+				}
 			}, func(t *testing.T) map[string]any {
 				records := decodeLines(t, &buf)
 				if len(records) != 1 {
 					t.Fatalf("got %d records, want 1", len(records))
 				}
-				// slogtest looks up the built-in slog keys.
 				record := records[0]
+				if _, ok := record["function_request_id"]; ok != tt.contextFields {
+					t.Fatalf("function_request_id present = %v, want %v", ok, tt.contextFields)
+				}
+				// slogtest looks up the built-in slog keys.
 				for from, to := range map[string]string{"timestamp": slog.TimeKey, "message": slog.MessageKey} {
 					if v, ok := record[from]; ok {
 						record[to] = v
@@ -314,6 +356,16 @@ func TestHandlerLevel(t *testing.T) {
 			name: "FATAL",
 			env:  lambdaEnv{powertoolsLogLevel: "FATAL"},
 			want: powerslog.LevelFatal,
+		},
+		{
+			name: "CRITICAL is an alias for FATAL",
+			env:  lambdaEnv{powertoolsLogLevel: "CRITICAL"},
+			want: powerslog.LevelFatal,
+		},
+		{
+			name: "SILENT is above every level",
+			env:  lambdaEnv{powertoolsLogLevel: "SILENT"},
+			want: slog.Level(math.MaxInt),
 		},
 		{
 			name:  "unknown AWS_LAMBDA_LOG_LEVEL falls through to Options.Level",
@@ -672,6 +724,131 @@ func TestHandlerDoesNotRenameInsideGroups(t *testing.T) {
 	}
 }
 
+// resolvedValue is a slog.LogValuer that counts how often it is resolved.
+type resolvedValue struct {
+	value string
+	calls *int
+}
+
+func (v resolvedValue) LogValue() slog.Value {
+	if v.calls != nil {
+		*v.calls++
+	}
+	return slog.StringValue(v.value)
+}
+
+func TestHandlerDoesNotRenameUserAttrs(t *testing.T) {
+	ts := time.Date(2021, 12, 12, 21, 21, 8, 921_000_000, time.UTC)
+	src := &slog.Source{Function: "main.handler", File: "main.go", Line: 12}
+
+	tests := []struct {
+		name  string
+		apply func(slog.Handler) slog.Handler
+		ctx   func(context.Context) context.Context
+		attrs []slog.Attr
+		want  string
+	}{
+		{
+			name: "record attributes",
+			attrs: []slog.Attr{
+				slog.String(slog.MessageKey, "user"),
+				slog.Time(slog.TimeKey, ts),
+				slog.Any(slog.SourceKey, src),
+				slog.Any(slog.LevelKey, powerslog.LevelTrace),
+			},
+			want: `{"level":"INFO","message":"hello","msg":"user","time":"2021-12-12T21:21:08.921Z",` +
+				`"source":{"function":"main.handler","file":"main.go","line":12},"level":"DEBUG-4"}`,
+		},
+		{
+			name: "WithAttrs",
+			apply: func(h slog.Handler) slog.Handler {
+				return h.WithAttrs([]slog.Attr{slog.String(slog.MessageKey, "user")})
+			},
+			want: `{"level":"INFO","message":"hello","msg":"user"}`,
+		},
+		{
+			name: "WithAttrs and context fields",
+			apply: func(h slog.Handler) slog.Handler {
+				return h.WithAttrs([]slog.Attr{slog.String(slog.MessageKey, "user")})
+			},
+			ctx: func(ctx context.Context) context.Context {
+				return lambdaContext(ctx, testRequestID, "")
+			},
+			want: `{"level":"INFO","message":"hello","function_request_id":"` + testRequestID + `",` +
+				`"function_arn":"` + testFunctionARN + `","cold_start":true,"msg":"user"}`,
+		},
+		{
+			name: "inlined group",
+			attrs: []slog.Attr{
+				slog.Group("", slog.String(slog.MessageKey, "user"), slog.Int("n", 1)),
+			},
+			want: `{"level":"INFO","message":"hello","msg":"user","n":1}`,
+		},
+		{
+			name:  "named group",
+			attrs: []slog.Attr{slog.Group(slog.MessageKey, slog.String(slog.MessageKey, "user"))},
+			want:  `{"level":"INFO","message":"hello","msg":{"msg":"user"}}`,
+		},
+		{
+			name:  "LogValuer",
+			attrs: []slog.Attr{slog.Any(slog.MessageKey, resolvedValue{value: "user"})},
+			want:  `{"level":"INFO","message":"hello","msg":"user"}`,
+		},
+		{
+			name: "after WithGroup",
+			apply: func(h slog.Handler) slog.Handler {
+				return h.WithGroup("g")
+			},
+			attrs: []slog.Attr{slog.String(slog.MessageKey, "user")},
+			want:  `{"level":"INFO","message":"hello","g":{"msg":"user"}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lambdaEnv{}.set(t)
+			powerslog.ResetColdStart()
+			t.Cleanup(powerslog.ResetColdStart)
+
+			handler, buf := newTestHandler(t, &powerslog.Options{ReplaceAttr: removeTimeAttr()})
+			if tt.apply != nil {
+				handler = tt.apply(handler)
+			}
+			ctx := t.Context()
+			if tt.ctx != nil {
+				ctx = tt.ctx(ctx)
+			}
+			slog.New(handler).LogAttrs(ctx, slog.LevelInfo, "hello", tt.attrs...)
+
+			// The output is compared as text because decoding it would hide
+			// duplicate keys.
+			if got := strings.TrimSpace(buf.String()); got != tt.want {
+				t.Errorf("got  %s\nwant %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHandlerReplaceAttrSeesUserAttrs(t *testing.T) {
+	lambdaEnv{}.set(t)
+
+	var got []slog.Attr
+	handler, _ := newTestHandler(t, &powerslog.Options{
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.MessageKey && len(groups) == 0 {
+				got = append(got, a)
+			}
+			return a
+		},
+	})
+	slog.New(handler).Info("hello", slog.Any(slog.MessageKey, resolvedValue{value: "user"}))
+
+	want := []slog.Attr{slog.String(slog.MessageKey, "user")}
+	if !slices.EqualFunc(got, want, slog.Attr.Equal) {
+		t.Errorf("ReplaceAttr saw %v, want %v", got, want)
+	}
+}
+
 func TestHandlerReplaceAttrSeesPowertoolsNames(t *testing.T) {
 	lambdaEnv{}.set(t)
 
@@ -916,6 +1093,87 @@ func TestHandlerColdStart(t *testing.T) {
 		if got := records[i]["user"]; got != "alice" {
 			t.Errorf("record %d: user = %v, want alice", i, got)
 		}
+	}
+}
+
+func TestHandlerColdStartCountsRecordsThatAreNotLogged(t *testing.T) {
+	lambdaEnv{}.set(t)
+	powerslog.ResetColdStart()
+	t.Cleanup(powerslog.ResetColdStart)
+
+	handler, buf := newTestHandler(t, &powerslog.Options{Level: slog.LevelWarn})
+	logger := slog.New(handler)
+
+	logger.InfoContext(lambdaContext(t.Context(), "first-request", ""), "not logged")
+	logger.WarnContext(lambdaContext(t.Context(), "second-request", ""), "hello")
+
+	records := decodeLines(t, buf)
+	if len(records) != 1 {
+		t.Fatalf("got %d records, want 1", len(records))
+	}
+	if got := records[0]["function_request_id"]; got != "second-request" {
+		t.Errorf("function_request_id = %v, want second-request", got)
+	}
+	if got := records[0]["cold_start"]; got != false {
+		t.Errorf("cold_start = %v, want false", got)
+	}
+}
+
+func TestHandlerMixesRecordsWithAndWithoutContext(t *testing.T) {
+	// Lambda sets the trace header in the environment, so records logged
+	// without a context carry a trace ID but no request ID.
+	lambdaEnv{traceHeader: testTraceHeader}.set(t)
+	powerslog.ResetColdStart()
+	t.Cleanup(powerslog.ResetColdStart)
+
+	handler, buf := newTestHandler(t, nil)
+	var resolved int
+	logger := slog.New(handler).With(slog.Any("user", resolvedValue{value: "alice", calls: &resolved}))
+	ctx := lambdaContext(t.Context(), testRequestID, testTraceHeader)
+
+	logger.InfoContext(ctx, "hello")
+	logger.Info("hello")
+	built := resolved
+
+	const n = 5
+	for range n {
+		logger.InfoContext(ctx, "hello")
+		logger.Info("hello")
+	}
+	// The attributes are resolved each time the handler is rebuilt, which
+	// must not happen again once it has been built for both kinds of record.
+	if resolved != built {
+		t.Errorf("handler was rebuilt %d times for %d more records", resolved-built, 2*n)
+	}
+
+	records := decodeLines(t, buf)
+	if len(records) != 2*(n+1) {
+		t.Fatalf("got %d records, want %d", len(records), 2*(n+1))
+	}
+	for i, record := range records {
+		var wantRequestID any
+		if i%2 == 0 {
+			wantRequestID = testRequestID
+		}
+		if got := record["function_request_id"]; got != wantRequestID {
+			t.Errorf("record %d: function_request_id = %v, want %v", i, got, wantRequestID)
+		}
+		if got := record["xray_trace_id"]; got != testTraceID {
+			t.Errorf("record %d: xray_trace_id = %v, want %v", i, got, testTraceID)
+		}
+		if got := record["user"]; got != "alice" {
+			t.Errorf("record %d: user = %v, want alice", i, got)
+		}
+	}
+}
+
+func TestHandlerWithNothingReturnsReceiver(t *testing.T) {
+	handler, _ := newTestHandler(t, nil)
+	if got := handler.WithAttrs(nil); got != handler {
+		t.Error("WithAttrs(nil) returned a new handler")
+	}
+	if got := handler.WithGroup(""); got != handler {
+		t.Error(`WithGroup("") returned a new handler`)
 	}
 }
 
@@ -1195,4 +1453,41 @@ func TestHandlerSamplingLevelVar(t *testing.T) {
 	if !handler.Enabled(t.Context(), powerslog.LevelTrace) {
 		t.Error("Enabled(TRACE) after Set(TRACE) = false, want true")
 	}
+}
+
+func BenchmarkHandler(b *testing.B) {
+	// Lambda sets the trace header in the environment for every invocation.
+	lambdaEnv{traceHeader: testTraceHeader}.set(b)
+	powerslog.ResetColdStart()
+	b.Cleanup(powerslog.ResetColdStart)
+
+	logger := slog.New(powerslog.NewHandler(io.Discard, nil)).With(slog.String("user", "alice"))
+	noCtx := b.Context()
+	ctx := lambdaContext(noCtx, testRequestID, testTraceHeader)
+
+	b.Run("with context", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			logger.LogAttrs(ctx, slog.LevelInfo, "hello", slog.Int("n", 1))
+		}
+	})
+	b.Run("without context", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			logger.LogAttrs(noCtx, slog.LevelInfo, "hello", slog.Int("n", 1))
+		}
+	})
+	b.Run("alternating", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			logger.LogAttrs(ctx, slog.LevelInfo, "hello", slog.Int("n", 1))
+			logger.LogAttrs(noCtx, slog.LevelInfo, "hello", slog.Int("n", 1))
+		}
+	})
+	b.Run("not logged", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			logger.LogAttrs(ctx, slog.LevelDebug, "hello", slog.Int("n", 1))
+		}
+	})
 }
