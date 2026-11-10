@@ -8,6 +8,18 @@
 // and xray_trace_id) are read from the context passed to the handler, so the
 // *Context logging methods, such as [slog.Logger.InfoContext], must be used
 // with the context passed to the Lambda function handler to include them.
+//
+// The cold start is attributed to the first invocation whose context reaches
+// the handler, whether or not the record is logged. If the first invocation
+// makes no such logging call, the next invocation that does is reported as
+// the cold start instead.
+//
+// The handler writes the timestamp, level, message, location, service,
+// function_name, function_memory_size, sampling_rate, function_request_id,
+// function_arn, cold_start and xray_trace_id keys at the top level of each
+// record. Like the handlers in [log/slog], it does not remove duplicate keys,
+// so an attribute added at the top level under one of these names is written
+// in addition to the handler's own.
 package powerslog
 
 import (
@@ -61,6 +73,10 @@ const (
 	LevelFatal slog.Level = slog.LevelError + 4
 )
 
+// levelSilent is above every level that is logged, matching the SILENT level
+// of the Powertools logger for TypeScript.
+const levelSilent = slog.Level(math.MaxInt)
+
 // Options configures a [Handler]. A nil *Options is equivalent to the zero
 // value.
 type Options struct {
@@ -68,6 +84,10 @@ type Options struct {
 	// environment variable takes precedence over Level, and the
 	// POWERTOOLS_LOG_LEVEL environment variable is used when Level is nil.
 	// Defaults to [slog.LevelInfo].
+	//
+	// The environment variables accept TRACE, DEBUG, INFO, WARN or WARNING,
+	// ERROR, FATAL or CRITICAL, and SILENT, in any case. Any other value is
+	// ignored.
 	Level slog.Leveler
 
 	// SampleRate is the probability, from 0 to 1, that an invocation is
@@ -94,10 +114,16 @@ type Handler struct {
 	// root with ops applied. When a record carries context fields, they are
 	// added to root and ops are replayed so that the fields are always at the
 	// top level, regardless of any groups.
-	root       slog.Handler
-	handler    slog.Handler
-	ops        []handlerOp
-	cache      atomic.Pointer[cachedHandler]
+	root    slog.Handler
+	handler slog.Handler
+	ops     []handlerOp
+	// grouped is set once a group has been opened, after which attributes
+	// are no longer added at the top level.
+	grouped bool
+	// cache holds the handlers most recently built by withContextFields, one
+	// for records logged without a request ID and one for records logged with
+	// one, so that mixing the two does not rebuild the handler every time.
+	cache      [2]atomic.Pointer[cachedHandler]
 	level      slog.Leveler
 	sampleRate float64
 }
@@ -169,6 +195,10 @@ func NewHandler(w io.Writer, opts *Options) *Handler {
 // The handler ignores records whose level is lower, except for debug records
 // in a sampled invocation.
 func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
+	// Enabled sees every logging call, including those that are not logged,
+	// so the cold start is not misattributed to a later invocation when the
+	// first one logs nothing at an enabled level.
+	observeInvocation(ctx)
 	if level >= h.level.Level() {
 		return true
 	}
@@ -176,14 +206,20 @@ func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
 }
 
 func (h *Handler) sampled(ctx context.Context) bool {
-	if ctx == nil {
-		return false
-	}
-	lc, ok := lambdacontext.FromContext(ctx)
-	if !ok || lc == nil || lc.AwsRequestID == "" {
+	lc := lambdaContext(ctx)
+	if lc == nil || lc.AwsRequestID == "" {
 		return false
 	}
 	return sampleValue(lc.AwsRequestID) < h.sampleRate
+}
+
+// lambdaContext returns the Lambda context in ctx, or nil if there is none.
+func lambdaContext(ctx context.Context) *lambdacontext.LambdaContext {
+	if ctx == nil {
+		return nil
+	}
+	lc, _ := lambdacontext.FromContext(ctx)
+	return lc
 }
 
 // sampleValue maps a request ID to a value in [0, 1).
@@ -204,6 +240,9 @@ func sampleValue(requestID string) float64 {
 // Handle implements the slog.Handler interface and handles the Record.
 // It will only be called when Enabled returns true.
 func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
+	if !h.grouped && hasUserAttrToKeep(&record) {
+		record = keepUserAttrs(record)
+	}
 	fields := fieldsFromContext(ctx)
 	if fields == (contextFields{}) {
 		return h.handler.Handle(ctx, record)
@@ -217,7 +256,13 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if len(attrs) == 0 {
 		return h
 	}
-	return h.with(handlerOp{attrs: slices.Clone(attrs)})
+	attrs = slices.Clone(attrs)
+	if !h.grouped {
+		for i, attr := range attrs {
+			attrs[i] = keepUserAttr(attr)
+		}
+	}
+	return h.with(handlerOp{attrs: attrs})
 }
 
 // WithGroup returns a new Handler with the given group appended to
@@ -234,6 +279,7 @@ func (h *Handler) with(op handlerOp) *Handler {
 		root:       h.root,
 		handler:    op.apply(h.handler),
 		ops:        append(slices.Clip(h.ops), op),
+		grouped:    h.grouped || op.group != "",
 		level:      h.level,
 		sampleRate: h.sampleRate,
 	}
@@ -243,14 +289,18 @@ func (h *Handler) with(op handlerOp) *Handler {
 // fields. The result is cached because the fields rarely change between
 // records within an invocation.
 func (h *Handler) withContextFields(fields contextFields) slog.Handler {
-	if c := h.cache.Load(); c != nil && c.fields == fields {
+	slot := &h.cache[0]
+	if fields.requestID != "" {
+		slot = &h.cache[1]
+	}
+	if c := slot.Load(); c != nil && c.fields == fields {
 		return c.handler
 	}
 	handler := h.root.WithAttrs(fields.attrs())
 	for _, op := range h.ops {
 		handler = op.apply(handler)
 	}
-	h.cache.Store(&cachedHandler{fields: fields, handler: handler})
+	slot.Store(&cachedHandler{fields: fields, handler: handler})
 	return handler
 }
 
@@ -281,11 +331,11 @@ func (f contextFields) attrs() []slog.Attr {
 func fieldsFromContext(ctx context.Context) contextFields {
 	var fields contextFields
 	var header string
+	if lc := lambdaContext(ctx); lc != nil {
+		fields.requestID = lc.AwsRequestID
+		fields.functionARN = lc.InvokedFunctionArn
+	}
 	if ctx != nil {
-		if lc, ok := lambdacontext.FromContext(ctx); ok && lc != nil {
-			fields.requestID = lc.AwsRequestID
-			fields.functionARN = lc.InvokedFunctionArn
-		}
 		header, _ = ctx.Value(ctxKeyTraceID).(string)
 	}
 	if fields.requestID != "" {
@@ -309,19 +359,32 @@ func traceRoot(header string) string {
 	return ""
 }
 
-// coldStartRequestID is the request ID of the first invocation handled in
-// this execution environment.
+// coldStartRequestID is the request ID of the first invocation seen in this
+// execution environment.
 var coldStartRequestID atomic.Pointer[string]
 
-func isColdStart(requestID string) bool {
-	if coldStartRequestID.CompareAndSwap(nil, &requestID) {
-		return true
+// observeInvocation records the invocation in ctx, if there is one, as the
+// cold start when no invocation has been seen before.
+func observeInvocation(ctx context.Context) {
+	if coldStartRequestID.Load() != nil {
+		return
 	}
-	return *coldStartRequestID.Load() == requestID
+	if lc := lambdaContext(ctx); lc != nil && lc.AwsRequestID != "" {
+		isColdStart(lc.AwsRequestID)
+	}
 }
 
-func resetColdStart() {
-	coldStartRequestID.Store(nil)
+func isColdStart(requestID string) bool {
+	first := coldStartRequestID.Load()
+	if first == nil {
+		// The request ID is copied so that only the first call allocates.
+		id := requestID
+		if coldStartRequestID.CompareAndSwap(nil, &id) {
+			return true
+		}
+		first = coldStartRequestID.Load()
+	}
+	return *first == requestID
 }
 
 func resolveLevel(level slog.Leveler) slog.Leveler {
@@ -360,8 +423,10 @@ func parseLevel(s string) (slog.Level, bool) {
 		return slog.LevelWarn, true
 	case "ERROR":
 		return slog.LevelError, true
-	case "FATAL":
+	case "FATAL", "CRITICAL":
 		return LevelFatal, true
+	case "SILENT":
+		return levelSilent, true
 	}
 	return 0, false
 }
@@ -386,14 +451,88 @@ func levelName(l slog.Level) (string, bool) {
 
 func replaceAttr(next func([]string, slog.Attr) slog.Attr) func([]string, slog.Attr) slog.Attr {
 	return func(groups []string, a slog.Attr) slog.Attr {
-		if len(groups) == 0 {
-			a = renameBuiltin(a)
+		// Only the built-in keys are renamed or wrapped by keepUserAttr.
+		if len(groups) == 0 && isBuiltinKey(a.Key) {
+			if v, ok := userValue(a.Value); ok {
+				a.Value = v
+			} else {
+				a = renameBuiltin(a)
+			}
 		}
 		if next != nil {
 			return next(groups, a)
 		}
 		return a
 	}
+}
+
+// verbatim wraps the value of a top-level attribute that shares its key with
+// one of slog's built-in attributes. ReplaceAttr is given no other way to
+// tell the two apart, and without it an attribute such as
+// slog.String("msg", ...) would be renamed as though it were the message.
+type verbatim struct{ value slog.Value }
+
+// userValue returns the value wrapped by keepUserAttr, if v is one.
+func userValue(v slog.Value) (slog.Value, bool) {
+	if v.Kind() != slog.KindAny {
+		return slog.Value{}, false
+	}
+	wrapped, ok := v.Any().(verbatim)
+	return wrapped.value, ok
+}
+
+func isBuiltinKey(key string) bool {
+	switch key {
+	case slog.TimeKey, slog.LevelKey, slog.MessageKey, slog.SourceKey:
+		return true
+	}
+	return false
+}
+
+// keepUserAttr returns a top-level attribute in a form that is written as it
+// was given, rather than being renamed as a built-in attribute.
+func keepUserAttr(a slog.Attr) slog.Attr {
+	switch {
+	case isBuiltinKey(a.Key):
+		// Groups are never passed to ReplaceAttr, so they are not renamed.
+		a.Value = a.Value.Resolve()
+		if a.Value.Kind() != slog.KindGroup {
+			a.Value = slog.AnyValue(verbatim{a.Value})
+		}
+	case a.Key == "":
+		// A group without a key is inlined, so its attributes are top-level.
+		a.Value = a.Value.Resolve()
+		if a.Value.Kind() == slog.KindGroup {
+			attrs := slices.Clone(a.Value.Group())
+			for i, attr := range attrs {
+				attrs[i] = keepUserAttr(attr)
+			}
+			a.Value = slog.GroupValue(attrs...)
+		}
+	}
+	return a
+}
+
+// hasUserAttrToKeep reports whether keepUserAttr could change any of the
+// attributes of the record, which is rarely the case.
+func hasUserAttrToKeep(record *slog.Record) bool {
+	found := false
+	record.Attrs(func(a slog.Attr) bool {
+		found = a.Key == "" || isBuiltinKey(a.Key)
+		return !found
+	})
+	return found
+}
+
+// keepUserAttrs returns a copy of the record with keepUserAttr applied to
+// each of its attributes.
+func keepUserAttrs(record slog.Record) slog.Record {
+	kept := slog.NewRecord(record.Time, record.Level, record.Message, record.PC)
+	record.Attrs(func(a slog.Attr) bool {
+		kept.AddAttrs(keepUserAttr(a))
+		return true
+	})
+	return kept
 }
 
 func renameBuiltin(a slog.Attr) slog.Attr {
