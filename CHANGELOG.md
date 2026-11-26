@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/unfunco/powerslog/compare/v0.2.1...v0.2.2) (2026-11-26)
+
+
+### 🧹 Miscellaneous
+
+* Standardise changelog emoji sections ([#24](https://github.com/unfunco/powerslog/issues/24)) ([1456f06](https://github.com/unfunco/powerslog/commit/1456f068adc0e84186ea489e1651ae79a5ccdfb8))
+
 ## [0.2.1](https://github.com/unfunco/powerslog/compare/v0.2.0...v0.2.1) (2026-11-10)
 
 
